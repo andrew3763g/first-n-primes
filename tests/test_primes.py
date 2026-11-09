@@ -8,6 +8,7 @@ code has to match them.
 
 from __future__ import annotations
 
+import errno
 import math
 import subprocess
 import sys
@@ -291,48 +292,39 @@ def test_index_protocol_and_int_subclass() -> None:
     assert first_n_primes(MyInt(6)) == first_n_primes(6)
 
 
-def test_first_n_stops_after_n_primes(monkeypatch: pytest.MonkeyPatch) -> None:
-    pulled = 0
-    real = primes._iter_primes_upto
+def _counting_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    """Count primes pulled from the flag array. Returns the counter box."""
+    pulled = [0]
+    real = primes._primes_from_flags
 
-    def counting(limit: int) -> object:
-        nonlocal pulled
-
+    def counting(limit: int, flags: bytearray) -> object:
         def generator() -> object:
-            nonlocal pulled
-            for prime in real(limit):
-                pulled += 1
+            for prime in real(limit, flags):
+                pulled[0] += 1
                 yield prime
 
         return generator()
 
-    monkeypatch.setattr(primes, "_iter_primes_upto", counting)
+    monkeypatch.setattr(primes, "_primes_from_flags", counting)
+    return pulled
+
+
+def test_first_n_stops_after_n_primes(monkeypatch: pytest.MonkeyPatch) -> None:
+    pulled = _counting_flags(monkeypatch)
     assert first_n_primes(10)[-1] == 29
-    # The bound for n=10 is well above 29, so a full-list-then-slice
-    # implementation would pull every prime under that bound.
-    assert pulled == 10
+    # The bound for n=10 is well above 29, so walking every prime under
+    # that bound would pull more than 10 values.
+    assert pulled[0] == 10
 
 
 def test_nth_does_not_call_first_n_primes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pulled = 0
-    real_iter = primes._iter_primes_upto
-
-    def counting(limit: int) -> object:
-        def generator() -> object:
-            nonlocal pulled
-            for prime in real_iter(limit):
-                pulled += 1
-                yield prime
-
-        return generator()
-
-    monkeypatch.setattr(primes, "_iter_primes_upto", counting)
+    pulled = _counting_flags(monkeypatch)
     assert nth_prime(10) == 29
-    # Same bound as the list test: consuming every prime under the bound
-    # would pull more than 10 values.
-    assert pulled == 10
+    assert pulled[0] == 10
 
     def forbidden(n: int) -> list[int]:
         raise AssertionError(f"full list was built for n={n}")
@@ -389,24 +381,95 @@ def test_cli_ordinals(n: int, line: str) -> None:
     assert result.stdout == line
 
 
-def test_list_mode_prints_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-
-    def spy(
-        message: object = "",
-        *,
-        file: object = None,
-        end: object = "\n",
-        sep: object = " ",
-        flush: object = False,
-    ) -> None:
-        del end, sep, flush
-        assert file is None
-        calls.append(str(message))
-
-    monkeypatch.setattr(primes, "print", spy, raising=False)
+def test_list_mode_snapshot_capsys(capsys: pytest.CaptureFixture[str]) -> None:
     assert primes.main(["50"]) == 0
-    assert calls == [EXPECTED_50[:-1]]
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == EXPECTED_50
+
+
+@pytest.mark.parametrize(
+    ("argument", "header", "last_line"),
+    [
+        ("1", "First prime number (Sieve of Eratosthenes):", " 1. 2"),
+        ("2", "First 2 prime numbers (Sieve of Eratosthenes):", " 2. 3"),
+    ],
+)
+def test_header_grammar(
+    argument: str,
+    header: str,
+    last_line: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert primes.main([argument]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert captured.err == ""
+    assert lines[0] == header
+    assert lines[-1] == last_line
+
+
+def test_cli_list_mode_streams(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pulled = _counting_flags(monkeypatch)
+
+    def forbidden(n: int) -> list[int]:
+        raise AssertionError(f"full list was built for n={n}")
+
+    monkeypatch.setattr(primes, "first_n_primes", forbidden)
+    assert primes.main(["10"]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert captured.err == ""
+    assert lines[0] == "First 10 prime numbers (Sieve of Eratosthenes):"
+    assert lines[-1] == "10. 29"
+    assert len(lines) == 11
+    # Streaming stops after the 10th prime. Materialising every prime
+    # under the bound would pull more.
+    assert pulled[0] == 10
+
+
+def test_closed_stdout_pipe_is_silent() -> None:
+    proc = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "100000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout is not None
+        first = proc.stdout.readline()
+        proc.stdout.close()
+        stderr = b"" if proc.stderr is None else proc.stderr.read()
+        returncode = proc.wait(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+    assert first.startswith(b"First 100000 prime numbers")
+    assert returncode == 0
+    assert stderr == b""
+
+
+def test_einval_on_stdout_is_a_quiet_success(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class ClosedText:
+        def write(self, data: str) -> int:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        def writelines(self, lines: object) -> None:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        def flush(self) -> None:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        def fileno(self) -> int:
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(sys, "stdout", ClosedText())
+    assert primes.main(["5", "--nth"]) == 0
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize(
@@ -435,14 +498,66 @@ def test_invalid_cli_exits_with_status_2(args: list[str]) -> None:
 def test_memory_error_has_a_clear_message(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    def explode(n: int) -> list[int]:
+    def explode(limit: int) -> bytearray:
         raise MemoryError
 
-    monkeypatch.setattr(primes, "first_n_primes", explode)
+    monkeypatch.setattr(primes, "_odd_sieve_flags", explode)
     assert primes.main(["5"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "not enough memory" in captured.err
+
+
+def test_huge_inputs_raise_our_overflow() -> None:
+    calls = (
+        lambda: first_n_primes(10**30),
+        lambda: first_n_primes(10**400),
+        lambda: nth_prime(10**30),
+        lambda: primes_up_to(10**30),
+        lambda: primes._nth_prime_upper_bound(10**400),
+    )
+    for call in calls:
+        with pytest.raises(OverflowError) as caught:
+            call()
+        message = str(caught.value)
+        assert "supported maximum" in message
+        assert "islice" not in message
+        assert "float" not in message
+    with pytest.raises(OverflowError):
+        first_n_primes(sys.maxsize + 1)
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["٥", "1_000", "+5", " 7 ", "1.5", "-05"],
+)
+def test_cli_rejects_non_plain_digits(token: str) -> None:
+    result = run_cli(token)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "error:" in result.stderr
+
+
+def test_negative_error_shows_the_original_text() -> None:
+    result = run_cli("--", "-05")
+    assert result.returncode == 2
+    assert "'-05'" in result.stderr
+    assert "'-5'" not in result.stderr
+
+
+def test_long_invalid_token_is_truncated() -> None:
+    token = "1" * 5000
+    result = run_cli(token)
+    assert result.returncode == 2
+    assert token not in result.stderr
+    assert "1" * 40 in result.stderr
+    assert len(result.stderr) < 400
+
+
+def test_leading_zeros_are_plain_digits() -> None:
+    result = run_cli("007", "--nth")
+    assert result.returncode == 0
+    assert result.stdout == "The 7th prime is 17.\n"
 
 
 @settings(max_examples=40, deadline=None)
@@ -461,3 +576,14 @@ def test_property_limit_matches_reference_and_increases(limit: int) -> None:
 @given(st.integers(min_value=-5, max_value=120))
 def test_property_first_n_matches_reference(n: int) -> None:
     assert first_n_primes(n) == reference_first_n(n)
+
+
+@settings(max_examples=5, deadline=None)
+@given(st.integers(min_value=10_000, max_value=1_000_000))
+def test_property_large_limits_match_full_sieve(limit: int) -> None:
+    found = primes_up_to(limit)
+    assert found == sieve_full_slices(limit)
+    previous = 1
+    for prime in found:
+        assert prime > previous
+        previous = prime
