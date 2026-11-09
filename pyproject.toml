@@ -1,0 +1,33 @@
+[project]
+name = "first-n-primes"
+version = "1.0.0"
+description = "Print the first N primes using the Sieve of Eratosthenes."
+requires-python = ">=3.8"
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "ruff>=0.6",
+    "mypy>=1.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.mypy]
+# The program still runs on Python 3.8 (see requires-python). mypy 2.x
+# can no longer select --python-version 3.8, so the check uses 3.10.
+python_version = "3.10"
+strict = true
+files = ["first_n_primes.py", "tests/test_primes.py"]
+mypy_path = "."
