@@ -1,16 +1,41 @@
 [project]
 name = "first-n-primes"
-version = "1.1.0"
+version = "1.2.0"
 description = "Print the first N primes using the Sieve of Eratosthenes."
-requires-python = ">=3.10"
 readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Andrey" }]
+keywords = ["primes", "sieve", "eratosthenes", "number-theory", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+[project.urls]
+Homepage = "https://github.com/andrew3763g/first-n-primes"
+Source = "https://github.com/andrew3763g/first-n-primes"
+Issues = "https://github.com/andrew3763g/first-n-primes/issues"
+Changelog = "https://github.com/andrew3763g/first-n-primes#changelog"
 
 [project.optional-dependencies]
+# ruff and mypy are pinned exactly: a new release can change formatting
+# or add a check, and CI should not turn red on a commit that changed
+# nothing. pytest and hypothesis only need a compatible major version
+# (the newest hypothesis no longer installs on Python 3.10).
 dev = [
-    "pytest>=8",
-    "hypothesis>=6",
-    "ruff>=0.6",
-    "mypy>=1.8",
+    "pytest>=8,<10",
+    "hypothesis>=6,<7",
+    "ruff==0.17.4",
+    "mypy==2.4.1",
 ]
 
 [project.scripts]

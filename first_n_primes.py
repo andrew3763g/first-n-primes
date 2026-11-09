@@ -7,6 +7,10 @@ Requires Python 3.10 or newer.
 ``-n``/``--count`` option. The default output is the numbered list of
 the first N primes, written as a stream. ``--nth`` prints only the N-th
 prime.
+
+Exit codes: 0 success (including a reader that closed the pipe early and
+a process with no stdout), 1 out of memory, 2 invalid arguments, 3 the
+output could not be written, 130 interrupted with Ctrl+C.
 """
 
 from __future__ import annotations
@@ -18,9 +22,11 @@ import operator
 import os
 import re
 import sys
-from collections.abc import Iterator
-from itertools import compress, islice
-from typing import SupportsIndex, cast
+from collections.abc import Iterator, Sequence
+from itertools import chain, compress, islice
+from typing import SupportsIndex, TextIO, cast
+
+__version__ = "1.2.0"
 
 __all__ = [
     "first_n_primes",
@@ -29,11 +35,25 @@ __all__ = [
     "sieve_of_eratosthenes",
 ]
 
+# Exit codes of the command-line interface. argparse itself exits with 2.
+EXIT_OK = 0
+EXIT_NO_MEMORY = 1
+EXIT_USAGE = 2
+EXIT_WRITE_ERROR = 3
+EXIT_INTERRUPTED = 130
+
 # Command-line cap. Values above this are rejected before a sieve is
 # allocated. List mode streams lines, so a run at this cap is sized by
 # the odd-only flag array (about 90 MB at 10**7), not by a Python list of
 # every prime plus one joined string.
 MAX_COUNT = 10_000_000
+
+# List mode joins this many formatted lines into one write. One write per
+# line goes through the text layer ten million times at the cap and is
+# about a third slower; one write for everything holds the whole table in
+# memory. Measured at N = 10**7, 4096 lines is as fast as 65_536 and adds
+# about 1 MB to the peak instead of about 12 MB.
+_LINES_PER_WRITE = 4096
 
 # How much of an invalid argv token is repeated in an error message.
 _CLI_PREVIEW_CHARS = 40
@@ -44,11 +64,12 @@ _CLI_PREVIEW_CHARS = 40
 # At n = 688_383 the margin is most of the remaining slack, so it stays.
 _BOUND_MARGIN = 10
 
-# Rosser's theorem starts here. p_5 = 11, so a fixed limit of 15 covers 1..5.
+# The n(ln n + ln ln n) bound holds from here (see _nth_prime_upper_bound).
+# p_5 = 11, so a fixed limit of 15 covers 1..5.
 _ROSSER_MIN_N = 6
 _SMALL_N_LIMIT = 15
 
-# Dusart's upper bound, as used for n >= 688_383:
+# Dusart's upper bound (Dusart 2010, arXiv:1002.0442), for n >= 688_383:
 # p_n <= n * (ln n + ln ln n - 1 + (ln ln n - 2) / ln n).
 _DUSART_MIN_N = 688_383
 
@@ -74,16 +95,36 @@ def _as_int(value: object, name: str) -> int:
 
 
 def _ensure_supported(value: int, name: str) -> None:
-    """Reject magnitudes ``islice`` and ``math.log`` cannot accept cleanly.
+    """Reject an argument above ``sys.maxsize`` with this module's message.
 
-    ``sys.maxsize`` is the largest integer those operations treat as a
-    real bound. Anything larger used to raise ``ValueError`` from
-    ``islice`` or ``OverflowError`` from the float conversion, with a
-    message about that internal call. Callers get this function's
-    message instead.
+    Larger values would otherwise fail inside ``islice`` (``ValueError``)
+    or in the float conversion of the bound (``OverflowError``), with a
+    message about that internal call.
     """
     if value > sys.maxsize:
         raise OverflowError(f"{name} is above the supported maximum of {sys.maxsize}")
+
+
+def _sieve_size(limit: int) -> int:
+    """Length of the odd-only flag array for ``limit`` (``limit >= 3``)."""
+    return (limit - 1) // 2 + 1
+
+
+def _ensure_sieve_fits(limit: int, n: int) -> None:
+    """Reject a sieve whose flag array cannot be indexed.
+
+    The sieve for the n-th prime runs to about ``n * ln n``, roughly forty
+    times ``n`` near the top of the range. On a 64-bit build every
+    ``n`` from about 4.26e17 up to ``sys.maxsize`` passes
+    ``_ensure_supported`` but needs more than ``sys.maxsize`` flags, and
+    ``bytearray`` would fail with ``cannot fit 'int' into an index-sized
+    integer``. This check gives this module's message instead.
+    """
+    if _sieve_size(limit) > sys.maxsize:
+        raise OverflowError(
+            f"n = {n} needs a sieve up to {limit}, above the supported maximum "
+            f"sieve size of {sys.maxsize} odd numbers"
+        )
 
 
 def _nth_prime_upper_bound(n: int) -> int:
@@ -96,12 +137,15 @@ def _nth_prime_upper_bound(n: int) -> int:
     below 2. ``n > sys.maxsize`` raises ``OverflowError``.
 
     * ``1 <= n < 6``: the bound is the constant 15 (``p_5`` is 11).
-    * ``n >= 6``: Rosser's theorem (1938) states that
-      ``p_n < n * (ln n + ln ln n)`` for every integer n in this range.
-      The bound is that expression, rounded up.
+    * ``n >= 6``: ``p_n < n * (ln n + ln ln n)``. This follows from
+      Rosser and Schoenfeld (1962), who proved
+      ``p_n < n * (ln n + ln ln n - 0.5)`` for ``n >= 20``; the cases
+      6..19 are checked directly (Axler 2019 states the n >= 6 form).
+      Rosser's own 1939 theorem is the lower bound ``p_n > n ln n``.
+      The bound is the expression, rounded up.
     * ``n >= 688383``: Dusart's tighter bound
       ``p_n <= n * (ln n + ln ln n - 1 + (ln ln n - 2) / ln n)``
-      replaces Rosser's estimate. It is still an upper bound, so the
+      (Dusart 2010) replaces it. It is still an upper bound, so the
       sieve stays correct, and the flag array is shorter.
 
     The theorems assume exact real arithmetic. ``math.ceil`` plus a
@@ -139,9 +183,7 @@ def _odd_sieve_flags(limit: int) -> bytearray:
     following odd multiples of ``p`` are exactly ``p`` indices apart:
     one index steps the value by 2, so ``p`` indices step it by ``2p``.
     """
-    # Last index whose odd number is still <= limit.
-    last_index = (limit - 1) // 2
-    size = last_index + 1
+    size = _sieve_size(limit)
     is_prime = bytearray(b"\x01") * size
     is_prime[0] = 0
 
@@ -150,9 +192,8 @@ def _odd_sieve_flags(limit: int) -> bytearray:
     # square inside the array, so they do not need to cross anything off.
     max_index = (root - 1) // 2
     # One zero buffer, reused for every slice assignment. The widest
-    # slice belongs to prime 3 (smallest step). A fresh bytes() object
-    # of that width on every prime is a second large allocation;
-    # memoryview slices share this buffer instead of copying it.
+    # slice belongs to prime 3 (smallest step), so it sets the length;
+    # memoryview slices of it are views, not copies.
     if max_index >= 1:
         start_at_three = (3 * 3) // 2
         zero_buffer = memoryview(bytes(len(range(start_at_three, size, 3))))
@@ -210,10 +251,13 @@ def _covering_sieve(n: int) -> tuple[int, bytearray]:
     """Return a limit and odd-flags that contain at least ``n`` primes.
 
     ``n`` is a positive integer at most ``sys.maxsize``. The bound is
-    widened only when a sieve comes up short.
+    widened only when a sieve comes up short. Every limit, including a
+    widened one, is checked against the largest sieve that can be
+    indexed before anything is allocated.
     """
     limit = _nth_prime_upper_bound(n)
     while True:
+        _ensure_sieve_fits(limit, n)
         count, flags = _sieve_count(limit)
         if count >= n:
             return limit, flags
@@ -226,8 +270,10 @@ def primes_up_to(limit: int) -> list[int]:
     ``limit`` must be an integer (``bool`` is rejected). A limit below
     2 returns ``[]``. A limit above ``sys.maxsize`` raises
     ``OverflowError`` with a message from this module, before any sieve
-    is allocated. The name describes the result; the algorithm is the
-    Sieve of Eratosthenes, also available as ``sieve_of_eratosthenes``.
+    is allocated. A smaller limit can still raise ``MemoryError`` if its
+    flag array does not fit. The name describes the result; the
+    algorithm is the Sieve of Eratosthenes, also available as
+    ``sieve_of_eratosthenes``.
     """
     limit = _as_int(limit, "limit")
     if limit < 2:
@@ -264,9 +310,11 @@ def first_n_primes(n: int) -> list[int]:
     ``n`` returns ``[]``. This is the documented library policy; the
     command-line interface rejects those values instead.
 
-    ``n > sys.maxsize`` raises ``OverflowError`` (``n is above the
-    supported maximum of ...``) instead of letting ``islice`` or
-    ``math.log`` fail with their own text.
+    ``OverflowError`` with this module's message is raised before any
+    allocation when ``n`` is above ``sys.maxsize`` or when the sieve for
+    ``n`` would need more flags than ``sys.maxsize`` (on 64-bit builds,
+    every ``n`` from about 4.26e17). A smaller ``n`` can still raise
+    ``MemoryError``.
 
     The returned list has exactly ``n`` primes. Primes past the n-th
     are not stored: iteration stops after ``n`` hits via ``islice``.
@@ -285,9 +333,9 @@ def nth_prime(n: int) -> int:
     """Return the n-th prime (1-based) without building the full list.
 
     ``n`` must be a positive integer. ``n < 1`` raises ``ValueError``.
-    ``n > sys.maxsize`` raises ``OverflowError`` with this module's
-    message, not an ``islice`` or ``float`` error. ``bool`` and other
-    non-integers raise ``TypeError``.
+    ``bool`` and other non-integers raise ``TypeError``. Arguments that
+    are too large raise ``OverflowError`` exactly as in
+    ``first_n_primes``.
 
     The sieve still marks every candidate up to the bound, but the
     primes themselves are counted off the flag array. Only the n-th
@@ -301,6 +349,9 @@ def nth_prime(n: int) -> int:
     # Skip n - 1 primes, then take the next one. islice does not store
     # the primes it walks past. The covering sieve has at least n primes.
     return next(islice(_primes_from_flags(limit, flags), n - 1, None))
+
+
+# --- command line ---------------------------------------------------------
 
 
 def _preview(text: str) -> str:
@@ -352,29 +403,102 @@ def _list_header(count: int) -> str:
     return f"First {count} prime numbers (Sieve of Eratosthenes):"
 
 
-def _write_numbered_primes(count: int) -> None:
-    """Stream the numbered list. No prime list and no joined string.
+def _numbered_lines(count: int) -> Iterator[str]:
+    """Sieve now, then return the output lines of list mode lazily.
 
-    The odd-flag array is the large object. Lines are formatted one at
-    a time and handed to ``writelines``.
+    This is a plain function, not a generator, so the sieve (and any
+    ``MemoryError``) happens here, before the first line is written. The
+    returned iterator formats one line per prime as it is consumed.
     """
-    width = max(2, len(str(count)))
     limit, flags = _covering_sieve(count)
     primes = islice(_primes_from_flags(limit, flags), count)
-    sys.stdout.write(_list_header(count) + "\n")
-    sys.stdout.writelines(
+    width = max(2, len(str(count)))
+    header = (_list_header(count) + "\n",)
+    body = (
         f"{index:{width}d}. {prime}\n" for index, prime in enumerate(primes, start=1)
     )
+    return chain(header, body)
+
+
+def _nth_lines(count: int) -> Iterator[str]:
+    """Compute the N-th prime now and return its single output line."""
+    prime = nth_prime(count)
+    return iter((f"The {_ordinal(count)} prime is {prime}.\n",))
+
+
+def _write_lines(out: TextIO, lines: Iterator[str]) -> None:
+    """Write ``lines`` in batches of ``_LINES_PER_WRITE``, then flush.
+
+    Only a batch of formatted lines is held at a time, never the table.
+    The flush is inside the caller's ``try`` so a closed pipe raises
+    there, not later while the interpreter shuts down.
+    """
+    while batch := list(islice(lines, _LINES_PER_WRITE)):
+        out.write("".join(batch))
+    out.flush()
+
+
+def _is_closed_reader(exc: OSError) -> bool:
+    """True when the reader of stdout went away.
+
+    ``BrokenPipeError`` is the closed pipe everywhere. On Windows a write
+    to a pipe whose reader exited fails with ``EINVAL`` instead; that
+    errno means a closed reader only there, and only for the write.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return sys.platform == "win32" and exc.errno == errno.EINVAL
+
+
+def _silence_stdout() -> None:
+    """Point stdout's descriptor at devnull after a failed write.
+
+    This is the recipe in the Python ``signal`` docs ("Note on SIGPIPE").
+    Text still buffered in ``sys.stdout`` is flushed again at shutdown;
+    without this, that second flush fails too and Python prints
+    "Exception ignored ..." to stderr.
+    """
+    stream = sys.stdout
+    if stream is None:
+        return
+    try:
+        stdout_fd = stream.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, stdout_fd)
+    finally:
+        os.close(devnull)
+
+
+def _report(message: str) -> None:
+    """Print one error line on stderr, if there is a stderr to print to."""
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        stream.write(f"error: {message}\n")
+        stream.flush()
+    except OSError:
+        pass
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="first-n-primes",
         description=(
             "Print the first N prime numbers using the Sieve of "
             "Eratosthenes. N is a required positive integer written in "
             "ASCII digits. The default is the full numbered list; "
             "--nth prints only the N-th prime."
-        )
+        ),
+        epilog=(
+            "exit codes: 0 success, 1 out of memory, 2 invalid arguments, "
+            "3 output could not be written, 130 interrupted"
+        ),
+        # Without this, "--n 50" is taken as "--nth 50".
+        allow_abbrev=False,
     )
     parser.add_argument(
         "count",
@@ -389,66 +513,51 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print only the N-th prime instead of the full list",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
     return parser
 
 
-def _redirect_stdout_to_devnull() -> None:
-    """Point stdout at devnull so the interpreter's exit flush stays quiet.
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI and return its exit code (see the module docstring).
 
-    This is the recipe in the Python ``signal`` docs ("Note on SIGPIPE").
-    A closed pipe has already raised; flushing the old stdout again
-    during shutdown would raise a second time and print a traceback.
+    Arguments are parsed first, so invalid input is exit status 2 even
+    when there is no stdout. With no stdout at all (a closed descriptor,
+    or ``pythonw`` on Windows) there is nowhere to print, and the run is
+    a quiet success, as it was when the script used ``print``.
+
+    The sieve runs before anything is written. Only the writing is
+    guarded for ``OSError``: a closed reader is success, any other write
+    failure (a full disk, for example) is exit status 3 with a one-line
+    message.
     """
-    try:
-        stdout_fd = sys.stdout.fileno()
-    except (AttributeError, OSError, ValueError):
-        return
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(devnull, stdout_fd)
-    finally:
-        os.close(devnull)
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Run the CLI.
-
-    Returns 0 on success. A closed stdout pipe (``BrokenPipeError``, or
-    ``OSError`` with ``errno.EINVAL`` on Windows) is also success: the
-    reader went away, which is not a program failure, and it must not
-    be confused with running out of memory.
-
-    Returns 1 when the sieve cannot allocate. Invalid arguments never
-    return: argparse exits with status 2.
-    """
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+    args = _build_parser().parse_args(argv)
     count = cast(int, args.count)
     nth = cast(bool, args.nth)
+
+    out = sys.stdout
+    if out is None:
+        return EXIT_OK
+
     try:
-        if nth:
-            prime = nth_prime(count)
-            sys.stdout.write(f"The {_ordinal(count)} prime is {prime}.\n")
-        else:
-            _write_numbered_primes(count)
-        # Flush here so a closed pipe raises inside this block, not
-        # later while the interpreter is shutting down.
-        sys.stdout.flush()
+        lines = _nth_lines(count) if nth else _numbered_lines(count)
+        try:
+            _write_lines(out, lines)
+        except OSError as exc:
+            _silence_stdout()
+            if _is_closed_reader(exc):
+                return EXIT_OK
+            _report(f"cannot write output: {exc.strerror or exc}")
+            return EXIT_WRITE_ERROR
     except MemoryError:
-        print(
-            f"error: not enough memory to compute {count} primes",
-            file=sys.stderr,
-        )
-        return 1
-    except BrokenPipeError:
-        _redirect_stdout_to_devnull()
-        return 0
-    except OSError as exc:
-        if exc.errno != errno.EINVAL:
-            raise
-        _redirect_stdout_to_devnull()
-        return 0
-    return 0
+        _report(f"not enough memory to compute {count} primes")
+        return EXIT_NO_MEMORY
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+    return EXIT_OK
 
 
 if __name__ == "__main__":

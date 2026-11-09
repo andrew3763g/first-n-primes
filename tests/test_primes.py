@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import errno
 import math
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -451,25 +453,183 @@ def test_closed_stdout_pipe_is_silent() -> None:
     assert stderr == b""
 
 
-def test_einval_on_stdout_is_a_quiet_success(
+class FailingText:
+    """A stdout stand-in whose writes fail with one errno."""
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+
+    def _fail(self) -> OSError:
+        return OSError(self.code, os.strerror(self.code))
+
+    def write(self, data: str) -> int:
+        raise self._fail()
+
+    def flush(self) -> None:
+        raise self._fail()
+
+    def fileno(self) -> int:
+        raise self._fail()
+
+
+class RecordingText:
+    """A stdout stand-in that records every write call."""
+
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+        self.flushed = False
+
+    def write(self, data: str) -> int:
+        self.writes.append(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushed = True
+
+
+@pytest.mark.parametrize("args", [["5"], ["5", "--nth"]])
+def test_einval_is_a_closed_reader_on_windows(
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(sys, "stdout", FailingText(errno.EINVAL))
+    assert primes.main(args) == primes.EXIT_OK
+    assert capsys.readouterr().err == ""
+
+
+def test_einval_elsewhere_is_a_write_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    class ClosedText:
-        def write(self, data: str) -> int:
-            raise OSError(errno.EINVAL, "Invalid argument")
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdout", FailingText(errno.EINVAL))
+    assert primes.main(["5"]) == primes.EXIT_WRITE_ERROR
+    assert capsys.readouterr().err.startswith("error: cannot write output:")
 
-        def writelines(self, lines: object) -> None:
-            raise OSError(errno.EINVAL, "Invalid argument")
 
-        def flush(self) -> None:
-            raise OSError(errno.EINVAL, "Invalid argument")
+@pytest.mark.parametrize("args", [["5"], ["5", "--nth"]])
+def test_full_disk_is_exit_3_with_one_line(
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "stdout", FailingText(errno.ENOSPC))
+    assert primes.main(args) == primes.EXIT_WRITE_ERROR
+    expected = f"error: cannot write output: {os.strerror(errno.ENOSPC)}\n"
+    assert capsys.readouterr().err == expected
 
-        def fileno(self) -> int:
-            raise OSError(errno.EINVAL, "Invalid argument")
 
-    monkeypatch.setattr(sys, "stdout", ClosedText())
-    assert primes.main(["5", "--nth"]) == 0
+@pytest.mark.skipif(not Path("/dev/full").exists(), reason="needs /dev/full")
+def test_dev_full_subprocess_reports_once() -> None:
+    with open("/dev/full", "w") as full:
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "1000"],
+            check=False,
+            stdout=full,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=ROOT,
+        )
+    assert result.returncode == 3
+    # One line from us; no "Exception ignored" from the shutdown flush.
+    assert result.stderr.splitlines() == [
+        f"error: cannot write output: {os.strerror(errno.ENOSPC)}"
+    ]
+
+
+@pytest.mark.parametrize("args", [["5"], ["5", "--nth"]])
+def test_no_stdout_is_a_quiet_success(
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "stdout", None)
+    assert primes.main(args) == primes.EXIT_OK
     assert capsys.readouterr().err == ""
+
+
+def test_no_stdout_still_rejects_bad_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "stdout", None)
+    with pytest.raises(SystemExit) as caught:
+        primes.main(["0"])
+    assert caught.value.code == 2
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX descriptor test")
+def test_closed_stdout_descriptor_subprocess() -> None:
+    for args in (["5"], ["5", "--nth"]):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            check=False,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=ROOT,
+            preexec_fn=lambda: os.close(1),
+        )
+        assert result.returncode == 0
+        assert result.stderr == ""
+
+
+def test_ctrl_c_during_the_sieve_exits_130(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def interrupt(n: int) -> tuple[int, bytearray]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(primes, "_covering_sieve", interrupt)
+    assert primes.main(["50"]) == primes.EXIT_INTERRUPTED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_ctrl_c_during_output_exits_130(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Interrupting(RecordingText):
+        def write(self, data: str) -> int:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "stdout", Interrupting())
+    assert primes.main(["50"]) == primes.EXIT_INTERRUPTED
+    assert capsys.readouterr().err == ""
+
+
+def test_list_mode_writes_in_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(primes, "_LINES_PER_WRITE", 7)
+    stream = RecordingText()
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert primes.main(["50"]) == primes.EXIT_OK
+    # Header plus 50 lines in batches of 7: 51 / 7 rounds up to 8 writes.
+    assert len(stream.writes) == 8
+    assert all(chunk.count("\n") <= 7 for chunk in stream.writes)
+    assert "".join(stream.writes) == EXPECTED_50
+    assert stream.flushed
+
+
+def test_version_flag() -> None:
+    result = run_cli("--version")
+    assert result.returncode == 0
+    assert result.stdout == f"first-n-primes {primes.__version__}\n"
+
+
+def test_version_matches_pyproject() -> None:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version = "([^"]+)"$', text, flags=re.MULTILINE)
+    assert match is not None
+    assert match.group(1) == primes.__version__
+
+
+def test_help_lists_exit_codes() -> None:
+    result = run_cli("--help")
+    assert result.returncode == 0
+    # argparse wraps the epilog to the terminal width; compare word runs.
+    words = " ".join(result.stdout.split())
+    assert "3 output could not be written" in words
+    assert "130 interrupted" in words
 
 
 @pytest.mark.parametrize(
@@ -486,6 +646,12 @@ def test_einval_on_stdout_is_a_quiet_success(
         ["--", "-5"],
         ["--", "0"],
         [str(primes.MAX_COUNT + 1)],
+        # Abbreviations are off: these are not --nth.
+        ["--n", "50"],
+        ["--nt", "7"],
+        # The options of version 2.0 are gone.
+        ["-n", "50"],
+        ["--count", "50"],
     ],
 )
 def test_invalid_cli_exits_with_status_2(args: list[str]) -> None:
@@ -525,6 +691,44 @@ def test_huge_inputs_raise_our_overflow() -> None:
         assert "float" not in message
     with pytest.raises(OverflowError):
         first_n_primes(sys.maxsize + 1)
+
+
+# Smallest n whose odd-only flag array needs more than sys.maxsize bytes
+# on a 64-bit build. It passes the n <= sys.maxsize check.
+FIRST_UNSIEVABLE_N = 425_648_847_054_116_832
+
+
+@pytest.mark.skipif(sys.maxsize != 2**63 - 1, reason="64-bit boundary")
+def test_sieve_size_is_checked_not_only_n() -> None:
+    calls = (
+        lambda: first_n_primes(FIRST_UNSIEVABLE_N),
+        lambda: first_n_primes(10**18),
+        lambda: first_n_primes(sys.maxsize),
+        lambda: nth_prime(10**18),
+        lambda: nth_prime(sys.maxsize),
+    )
+    for call in calls:
+        with pytest.raises(OverflowError) as caught:
+            call()
+        message = str(caught.value)
+        assert "supported maximum" in message
+        assert "index-sized" not in message
+    # One below the boundary still fits; only the allocation could fail.
+    below = FIRST_UNSIEVABLE_N - 1
+    primes._ensure_sieve_fits(primes._nth_prime_upper_bound(below), below)
+    with pytest.raises(OverflowError):
+        bound = primes._nth_prime_upper_bound(FIRST_UNSIEVABLE_N)
+        primes._ensure_sieve_fits(bound, FIRST_UNSIEVABLE_N)
+
+
+def test_widened_limit_is_checked_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sieve that comes up short is widened; the wider one is checked."""
+    monkeypatch.setattr(primes, "_nth_prime_upper_bound", lambda n: 2)
+    # n = 3 passes the n check; limits 2 and 4 hold 1 and 2 primes, and
+    # the next widening (8) needs 4 flags, more than the patched maximum.
+    monkeypatch.setattr(sys, "maxsize", 3)
+    with pytest.raises(OverflowError, match="needs a sieve up to 8"):
+        first_n_primes(3)
 
 
 @pytest.mark.parametrize(
